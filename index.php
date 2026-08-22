@@ -1,13 +1,29 @@
 <?php
-$host = "mysql";
-$user = "root";
-$password = "root";
-$database = "countries";
+$host = getenv('DB_HOST') ?: "mysql";
+$user = getenv('DB_USER') ?: "username";
+$password = getenv('DB_PASSWORD') ?: "password";
+$database = getenv('DB_NAME') ?: "countries";
+
+$maxRetries = 10;
+$retryDelay = 2;
+$pdo = null;
+
+for ($i = 1; $i <= $maxRetries; $i++) {
+    try {
+        $pdo = new PDO("mysql:host=$host;dbname=$database;charset=utf8mb4", $user, $password);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        echo "✅ Connected to database successfully.\n";
+        break;
+    } catch (PDOException $e) {
+        if ($i === $maxRetries) {
+            die("DB ERROR: " . $e->getMessage() . "\n");
+        }
+        echo "⏳ Waiting for database connection (attempt $i/$maxRetries)...\n";
+        sleep($retryDelay);
+    }
+}
 
 try {
-    $pdo = new PDO("mysql:host=$host;dbname=$database;charset=utf8mb4", $user, $password);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
     // === Create tables ===
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS characters (
@@ -44,7 +60,7 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ");
 } catch (PDOException $e) {
-    die("DB ERROR: " . $e->getMessage());
+    die("DB TABLE CREATION ERROR: " . $e->getMessage() . "\n");
 }
 
 function graphql_query($query)
@@ -191,6 +207,7 @@ function tvmaze_get(string $url): array
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        CURLOPT_USERAGENT => 'RickAndMortyImporter/1.0',
         CURLOPT_TIMEOUT => 30,
     ]);
     $body = curl_exec($ch);
@@ -207,73 +224,153 @@ function tvmaze_get(string $url): array
 }
 
 /**
- * TVMaze is used only when explicitly enabled:
- * IMPORT_TVMAZE=1 php index.php
- *
- * TVMaze character ids are namespaced to avoid colliding with ids from the
- * Rick and Morty API. Existing characters with the same name are reused.
+ * TVMaze Importer:
+ * Fetches episodes and characters for seasons not present in the official Rick and Morty API (Season 6+).
+ * Preserves the exact same data format as the Rick and Morty API:
+ * - Episodes: sequential IDs continuing from existing DB, formatted air_date ('F j, Y', e.g. 'September 4, 2022'), code ('S06E01')
+ * - Characters: matches and reuses existing characters by name, assigns sequential IDs to new characters, sets unknown defaults
+ * - Relations: links main cast and guest cast to episodes in character_episode
  */
 function import_tvmaze(PDO $pdo, int $showId = 216): void
 {
-    $episodes = tvmaze_get("https://api.tvmaze.com/shows/$showId/episodes?specials=1");
+    echo "🎬 Starting TVMaze import for missing seasons...\n";
+
+    // 1. Map existing characters
     $knownCharacters = [];
     foreach ($pdo->query("SELECT id, name FROM characters") as $row) {
         $knownCharacters[mb_strtolower(trim($row['name']))] = (int) $row['id'];
     }
+    $maxCharId = (int) $pdo->query("SELECT COALESCE(MAX(id), 0) FROM characters")->fetchColumn();
+
+    // 2. Map existing episodes by code
+    $knownEpisodes = [];
+    foreach ($pdo->query("SELECT id, code FROM episodes") as $row) {
+        $knownEpisodes[$row['code']] = (int) $row['id'];
+    }
+    $maxEpId = (int) $pdo->query("SELECT COALESCE(MAX(id), 0) FROM episodes")->fetchColumn();
+
+    // 3. Fetch main cast to associate with all new episodes
+    $mainCharIds = [];
+    try {
+        $mainCast = tvmaze_get("https://api.tvmaze.com/shows/$showId/cast");
+        foreach ($mainCast as $credit) {
+            $char = $credit['character'] ?? [];
+            if (!isset($char['name'])) continue;
+            $nameKey = mb_strtolower(trim($char['name']));
+            if (isset($knownCharacters[$nameKey])) {
+                $mainCharIds[] = $knownCharacters[$nameKey];
+            }
+        }
+    } catch (Exception $e) {
+        echo "⚠️ TVMaze main cast fetch notice: " . $e->getMessage() . "\n";
+    }
+
+    // 4. Fetch all episodes
+    $episodes = tvmaze_get("https://api.tvmaze.com/shows/$showId/episodes?specials=1");
+    $importedEpCount = 0;
+    $newCharsCount = 0;
 
     foreach ($episodes as $episode) {
-        $localEpisodeId = 900000 + (int) $episode['id'];
         $season = (int) ($episode['season'] ?? 0);
         $number = (int) ($episode['number'] ?? 0);
-        if ($season < 6) {
+
+        // Only import season 6 and later regular episodes
+        if ($season < 6 || $number <= 0) {
             continue;
         }
+
         $code = sprintf('S%02dE%02d', $season, $number);
+
+        if (isset($knownEpisodes[$code])) {
+            $epId = $knownEpisodes[$code];
+        } else {
+            $maxEpId++;
+            $epId = $maxEpId;
+            $knownEpisodes[$code] = $epId;
+        }
+
+        // Format air_date exactly like Rick and Morty API (e.g. 'September 4, 2022')
+        $airDate = !empty($episode['airdate']) ? date('F j, Y', strtotime($episode['airdate'])) : null;
+
         $pdo->prepare("
             INSERT INTO episodes (id, name, code, air_date)
             VALUES (:id, :name, :code, :air_date)
             ON DUPLICATE KEY UPDATE
               name = VALUES(name), code = VALUES(code), air_date = VALUES(air_date)
         ")->execute([
-            ':id' => $localEpisodeId,
+            ':id' => $epId,
             ':name' => $episode['name'],
             ':code' => $code,
-            ':air_date' => $episode['airdate'] ?? null,
+            ':air_date' => $airDate,
         ]);
+        $importedEpCount++;
 
-        // Guest cast gives episode-specific character credits.
-        $guestCast = tvmaze_get("https://api.tvmaze.com/episodes/{$episode['id']}/guestcast");
-        foreach ($guestCast as $credit) {
-            $character = $credit['character'] ?? [];
-            if (!isset($character['id'], $character['name'])) {
-                continue;
-            }
-            $nameKey = mb_strtolower(trim($character['name']));
-            $characterId = $knownCharacters[$nameKey] ?? (100000 + (int) $character['id']);
-            $knownCharacters[$nameKey] = $characterId;
-            $image = $character['image']['original'] ?? $character['image']['medium'] ?? null;
-
-            $pdo->prepare("
-                INSERT INTO characters
-                    (id, name, species, status, gender, origin, location, image)
-                VALUES (:id, :name, NULL, NULL, NULL, NULL, NULL, :image)
-                ON DUPLICATE KEY UPDATE name = VALUES(name), image = COALESCE(VALUES(image), image)
-            ")->execute([
-                ':id' => $characterId,
-                ':name' => $character['name'],
-                ':image' => $image,
-            ]);
+        // Link series main cast (Rick, Morty, etc.) to this episode
+        foreach ($mainCharIds as $mainId) {
             $pdo->prepare("
                 INSERT IGNORE INTO character_episode (character_id, episode_id)
                 VALUES (:character_id, :episode_id)
             ")->execute([
-                ':character_id' => $characterId,
-                ':episode_id' => $localEpisodeId,
+                ':character_id' => $mainId,
+                ':episode_id' => $epId,
             ]);
         }
-        usleep(500000);
+
+        // Guest cast gives episode-specific character credits
+        try {
+            $guestCast = tvmaze_get("https://api.tvmaze.com/episodes/{$episode['id']}/guestcast");
+            foreach ($guestCast as $credit) {
+                $character = $credit['character'] ?? [];
+                if (!isset($character['name']) || trim($character['name']) === '') {
+                    continue;
+                }
+
+                $charName = trim($character['name']);
+                $nameKey = mb_strtolower($charName);
+
+                if (isset($knownCharacters[$nameKey])) {
+                    $characterId = $knownCharacters[$nameKey];
+                } else {
+                    $maxCharId++;
+                    $characterId = $maxCharId;
+                    $knownCharacters[$nameKey] = $characterId;
+                    $newCharsCount++;
+                }
+
+                $image = $character['image']['original'] ?? $character['image']['medium'] ?? $credit['person']['image']['original'] ?? null;
+                $gender = $credit['person']['gender'] ?? 'unknown';
+
+                $pdo->prepare("
+                    INSERT INTO characters
+                        (id, name, species, status, gender, origin, location, image)
+                    VALUES (:id, :name, 'unknown', 'unknown', :gender, 'unknown', 'unknown', :image)
+                    ON DUPLICATE KEY UPDATE
+                        name = VALUES(name),
+                        gender = IF(characters.gender IS NULL OR characters.gender = '' OR characters.gender = 'unknown', VALUES(gender), characters.gender),
+                        image = COALESCE(characters.image, VALUES(image))
+                ")->execute([
+                    ':id' => $characterId,
+                    ':name' => $charName,
+                    ':gender' => $gender,
+                    ':image' => $image,
+                ]);
+
+                $pdo->prepare("
+                    INSERT IGNORE INTO character_episode (character_id, episode_id)
+                    VALUES (:character_id, :episode_id)
+                ")->execute([
+                    ':character_id' => $characterId,
+                    ':episode_id' => $epId,
+                ]);
+            }
+        } catch (Exception $e) {
+            echo "⚠️ Notice: could not fetch guest cast for episode {$episode['id']}: " . $e->getMessage() . "\n";
+        }
+
+        usleep(250000); // 250ms sleep between episode queries to respect TVMaze rate limits
     }
-    echo "✅ Imported TVMaze seasons and guest characters\n";
+
+    echo "✅ Imported TVMaze seasons ($importedEpCount episodes, $newCharsCount new characters)\n";
 }
 
 // === 1. Import Characters ===
@@ -416,9 +513,8 @@ do {
 // === 4. Optional supplemental data (for seasons not present in the API) ===
 import_supplemental_data($pdo, __DIR__ . '/supplemental_data.json');
 
-// === 5. Optional TVMaze source ===
-if (getenv('IMPORT_TVMAZE') === '1') {
-    import_tvmaze($pdo);
-}
+// === 5. TVMaze source for missing seasons ===
+import_tvmaze($pdo);
 
 echo "🎉 All data imported successfully.\n";
+

@@ -2,29 +2,38 @@ services:
   mysql:
     image: mysql:8.0
     container_name: graphql_mysql
+    restart: always
     environment:
       MYSQL_DATABASE: countries
       MYSQL_USER: username
       MYSQL_PASSWORD: password
-      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: root
     ports:
       - "3306:3306"
     volumes:
-      - ./mysql_data:/var/lib/mysql
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
   php:
     build: .
     container_name: graphql_php
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     volumes:
       - .:/app
     working_dir: /app
     command: php index.php
+
   phpmyadmin:
     depends_on:
       - mysql
-    image: phpmyadmin:latest
+    image: phpmyadmin/phpmyadmin:latest
     restart: always
     ports:
       - 80:80
@@ -34,3 +43,4 @@ services:
 
 volumes:
   mysql_data:
+
