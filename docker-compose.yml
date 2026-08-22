@@ -1,11 +1,12 @@
 services:
   mysql:
-    image: mysql:8.0.31
+    image: mysql:8.0
     container_name: graphql_mysql
     environment:
       MYSQL_DATABASE: countries
       MYSQL_USER: username
       MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: password
     ports:
       - "3306:3306"
     volumes:
@@ -23,7 +24,7 @@ services:
   phpmyadmin:
     depends_on:
       - mysql
-    image: phpmyadmin:5.2.0-apache
+    image: phpmyadmin:latest
     restart: always
     ports:
       - 80:80
